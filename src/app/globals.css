@@ -1,26 +1,227 @@
 @import "tailwindcss";
+@plugin "@tailwindcss/typography";
 
-:root {
-  --background: #ffffff;
-  --foreground: #171717;
-}
+/* Class-based dark mode (set on <html> before first paint — see layout.tsx). */
+@custom-variant dark (&:where(.dark, .dark *));
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  --font-sans: var(--font-inter), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
+@theme {
+  /* Semantic surfaces */
+  --color-surface: #ffffff;
+  --color-surface-raised: #ffffff;
+  --color-ink: #0b1120; /* always-dark panels (marketing, video) */
+  --color-ink-700: #334155; /* raised/hover surfaces on ink — never remapped */
+  --color-ink-800: #1e293b;
+
+  --color-brand-50: #eef4ff;
+  --color-brand-100: #dae6ff;
+  --color-brand-200: #bdd3ff;
+  --color-brand-300: #90b7ff;
+  --color-brand-400: #5c8ffd;
+  --color-brand-500: #3768f9;
+  --color-brand-600: #2149ee;
+  --color-brand-700: #1a37db;
+  --color-brand-800: #1c2fb1;
+  --color-brand-900: #1d2e8b;
+  --color-brand-950: #161e55;
+
+  /* Primary action colours are separate tokens so dark mode can tune them
+     independently of brand text shades. */
+  --color-primary: #2149ee;
+  --color-primary-hover: #1a37db;
+  --color-primary-active: #1c2fb1;
+
+  /* Solid destructive fills (buttons, LIVE badges, counters). Separate from the
+     red text shades, which dark mode lightens for contrast. */
+  --color-danger: #dc2626;
+  --color-danger-hover: #b91c1c;
+
+  --shadow-card: 0 1px 2px 0 rgb(15 23 42 / 0.04), 0 1px 3px 0 rgb(15 23 42 / 0.06);
+  --shadow-elevated: 0 10px 30px -10px rgb(15 23 42 / 0.2), 0 4px 10px -4px rgb(15 23 42 / 0.08);
+
+  --animate-fade-in: fade-in 0.2s ease-out;
+  --animate-slide-in-left: slide-in-left 0.25s ease-out;
+  --animate-zoom-in: zoom-in 0.18s ease-out;
+  --animate-pop-in: pop-in 0.16s ease-out;
+
+  @keyframes fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes slide-in-left {
+    from { transform: translateX(-100%); }
+    to { transform: translateX(0); }
+  }
+  /* Uses the independent `scale`/`translate` properties: Tailwind v4 centres
+     dialogs with the `translate` property, and animating `transform:
+     translate(…)` on top of that doubled the offset (the dialog slid in from
+     the side, then jumped to the centre). */
+  @keyframes zoom-in {
+    from { opacity: 0; scale: 0.97; transform: translateY(1%); }
+    to { opacity: 1; scale: 1; transform: none; }
+  }
+  @keyframes pop-in {
+    from { opacity: 0; transform: translateY(-4px) scale(0.98); }
+    to { opacity: 1; transform: translateY(0) scale(1); }
   }
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+/* ── Dark theme ───────────────────────────────────────────────────────────────
+   Neutral and tint scales are remapped, so components written with the light
+   palette (bg-surface, text-slate-900, bg-brand-50 …) adapt automatically. */
+:root.dark {
+  color-scheme: dark;
+
+  --color-surface: #111a2e;
+  --color-surface-raised: #16213a;
+
+  --color-slate-50: #0a1020;
+  --color-slate-100: #18233a;
+  --color-slate-200: #24314b;
+  --color-slate-300: #34435f;
+  --color-slate-400: #64748b;
+  --color-slate-500: #94a3b8;
+  --color-slate-600: #aebbcd;
+  --color-slate-700: #c8d2e0;
+  --color-slate-800: #dde4ee;
+  --color-slate-900: #eef2f8;
+  --color-slate-950: #f8fafc;
+
+  --color-brand-50: #15214a;
+  --color-brand-100: #1b2b60;
+  --color-brand-200: #253b80;
+  --color-brand-300: #3d5bb5;
+  --color-brand-400: #6f93ff;
+  --color-brand-500: #7c9dff;
+  --color-brand-600: #8eabff;
+  --color-brand-700: #a9c0ff;
+  --color-brand-800: #c4d4ff;
+  --color-brand-900: #dbe5ff;
+
+  --color-primary: #3c66ff;
+  --color-primary-hover: #5279ff;
+  --color-primary-active: #2f58f0;
+
+  --color-emerald-50: #0c2a22;
+  --color-emerald-100: #0f3a2e;
+  --color-emerald-200: #155240;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+  --color-emerald-800: #a7f3d0;
+  --color-emerald-900: #d1fae5;
+
+  --color-amber-50: #2d2008;
+  --color-amber-100: #3d2b0b;
+  --color-amber-200: #5a3f12;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+  --color-amber-900: #fef3c7;
+
+  --color-red-50: #2e1116;
+  --color-red-100: #3f151c;
+  --color-red-200: #5c1d27;
+  --color-red-500: #f87171;
+  --color-red-600: #f87171;
+  --color-red-700: #fca5a5;
+  --color-red-800: #fecaca;
+  --color-red-900: #fee2e2;
+
+  --color-danger: #dc2626;
+  --color-danger-hover: #ef4444;
+
+  --color-sky-50: #0b2333;
+  --color-sky-100: #0e2f45;
+  --color-sky-200: #154361;
+  --color-sky-600: #38bdf8;
+  --color-sky-700: #7dd3fc;
+  --color-sky-900: #e0f2fe;
+
+  --color-violet-50: #1f1638;
+  --color-violet-100: #2a1d4d;
+  --color-violet-600: #a78bfa;
+  --color-violet-700: #c4b5fd;
+
+  --color-rose-50: #2e1220;
+  --color-rose-100: #3f172b;
+  --color-rose-600: #fb7185;
+  --color-rose-700: #fda4af;
+
+  --shadow-card: 0 1px 2px 0 rgb(0 0 0 / 0.3), 0 0 0 1px rgb(255 255 255 / 0.02);
+  --shadow-elevated: 0 18px 40px -12px rgb(0 0 0 / 0.6), 0 4px 12px -4px rgb(0 0 0 / 0.4);
+}
+
+@layer base {
+  html {
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-slate-50 text-slate-900;
+  }
+
+  :focus-visible {
+    @apply outline-2 outline-offset-2 outline-brand-500;
+  }
+
+  ::selection {
+    @apply bg-brand-100 text-brand-900;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
+
+@utility scrollbar-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-slate-300) transparent;
+}
+
+/* cmdk palette items */
+[cmdk-item][data-selected="true"] {
+  background: var(--color-slate-100);
+  color: var(--color-slate-900);
+}
+
+@media print {
+  .no-print {
+    display: none !important;
+  }
+}
+
+/* Force the light palette inside a subtree (e.g. printable certificates). */
+:root.dark .theme-light {
+  color-scheme: light;
+  --color-surface: #ffffff;
+  --color-slate-50: #f8fafc;
+  --color-slate-100: #f1f5f9;
+  --color-slate-200: #e2e8f0;
+  --color-slate-300: #cbd5e1;
+  --color-slate-400: #94a3b8;
+  --color-slate-500: #64748b;
+  --color-slate-600: #475569;
+  --color-slate-700: #334155;
+  --color-slate-800: #1e293b;
+  --color-slate-900: #0f172a;
+  --color-brand-50: #eef4ff;
+  --color-brand-100: #dae6ff;
+  --color-brand-200: #bdd3ff;
+  --color-brand-300: #90b7ff;
+  --color-brand-400: #5c8ffd;
+  --color-brand-500: #3768f9;
+  --color-brand-600: #2149ee;
+  --color-brand-700: #1a37db;
+  --color-brand-800: #1c2fb1;
+  --color-brand-900: #1d2e8b;
+  --color-primary: #2149ee;
+  --color-primary-hover: #1a37db;
 }

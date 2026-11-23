@@ -1,0 +1,74 @@
+rules_version = '2';
+
+// Cloud Storage rules. Role/enrolment checks are delegated to Firestore via
+// cross-service rules so there is a single source of truth for permissions.
+service firebase.storage {
+  match /b/{bucket}/o {
+    function signedIn() { return request.auth != null; }
+    function role() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data.role;
+    }
+    function isAdmin() { return signedIn() && role() in ['admin', 'superadmin']; }
+    function isCourseStaff(courseId) {
+      return isAdmin() || (signedIn() && role() == 'instructor'
+        && request.auth.uid in firestore.get(/databases/(default)/documents/courses/$(courseId)).data.instructorIds);
+    }
+    function isEnrolled(courseId) {
+      return signedIn()
+        && firestore.exists(/databases/(default)/documents/courses/$(courseId)/enrollments/$(request.auth.uid));
+    }
+    function underMB(mb) { return request.resource.size < mb * 1024 * 1024; }
+    function isImage() { return request.resource.contentType.matches('image/(png|jpeg|webp)'); }
+    function isDocument() {
+      return request.resource.contentType.matches(
+        'application/pdf|application/zip|application/x-zip-compressed|image/(png|jpeg|webp)|text/plain|'
+        + 'application/msword|application/vnd\\.openxmlformats-officedocument\\..*|'
+        + 'application/vnd\\.ms-(excel|powerpoint)');
+    }
+    function isLessonAsset() {
+      return isDocument() || request.resource.contentType.matches('video/(mp4|webm)');
+    }
+
+    // Profile photos — public to signed-in users, writable only by the owner.
+    match /avatars/{userId}/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if signedIn() && request.auth.uid == userId && isImage() && underMB(2);
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+
+    // Course cover images.
+    match /courses/{courseId}/cover/{fileName} {
+      allow read: if signedIn();
+      allow create, update: if isCourseStaff(courseId) && isImage() && underMB(5);
+      allow delete: if isCourseStaff(courseId);
+    }
+
+    // Lesson videos & downloadable resources — enrolled learners and staff only.
+    match /courses/{courseId}/lessons/{lessonId}/{fileName} {
+      allow read: if isCourseStaff(courseId) || isEnrolled(courseId);
+      allow create, update: if isCourseStaff(courseId) && isLessonAsset() && underMB(500);
+      allow delete: if isCourseStaff(courseId);
+    }
+
+    // Live class recordings — uploaded by course staff after the class,
+    // watched by enrolled learners and staff.
+    match /courses/{courseId}/recordings/{sessionId}/{fileName} {
+      allow read: if isCourseStaff(courseId) || isEnrolled(courseId);
+      allow create: if isCourseStaff(courseId)
+        && request.resource.contentType.matches('video/.*') && underMB(2048);
+      allow delete: if isCourseStaff(courseId);
+    }
+
+    // Assignment submissions — owner and course staff only.
+    match /submissions/{courseId}/{assignmentId}/{userId}/{fileName} {
+      allow read: if signedIn() && (request.auth.uid == userId || isCourseStaff(courseId));
+      allow create, update: if signedIn() && request.auth.uid == userId
+        && isEnrolled(courseId) && isDocument() && underMB(20);
+      allow delete: if signedIn() && request.auth.uid == userId;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

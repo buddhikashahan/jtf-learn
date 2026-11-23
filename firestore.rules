@@ -1,0 +1,498 @@
+rules_version = '2';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Firestore security rules — the authoritative access-control layer of the LMS.
+// Client-side route guards are UX only; every read/write is enforced here.
+//
+// Roles live in /users/{uid}.role and can only be changed by an admin
+// (or the Admin SDK via scripts/set-role.mjs).
+// ─────────────────────────────────────────────────────────────────────────────
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ────────────────────────────────────────────────────────────
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function hasRole(r) { return signedIn() && me().role == r; }
+    function isSuperAdmin() { return hasRole('superadmin'); }
+    // Super admins can do everything an admin can.
+    function isAdmin() { return signedIn() && me().role in ['admin', 'superadmin']; }
+    function isInstructor() { return hasRole('instructor'); }
+    function isStaffRole() { return isAdmin() || isInstructor(); }
+
+    function course(courseId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)).data;
+    }
+    function isCourseInstructor(courseId) {
+      return isInstructor() && uid() in course(courseId).instructorIds;
+    }
+    function isCourseStaff(courseId) { return isAdmin() || isCourseInstructor(courseId); }
+    function isEnrolled(courseId) {
+      return signedIn()
+        && exists(/databases/$(database)/documents/courses/$(courseId)/enrollments/$(request.auth.uid));
+    }
+    function canAccessCourse(courseId) { return isCourseStaff(courseId) || isEnrolled(courseId); }
+    function isPublished(courseId) { return course(courseId).status == 'published'; }
+
+    function incoming() { return request.resource.data; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function str(v, min, max) { return v is string && v.size() >= min && v.size() <= max; }
+    function optStr(v, max) { return v == null || (v is string && v.size() <= max); }
+    function num(v, min, max) { return v is number && v >= min && v <= max; }
+    function isNow(t) { return t == request.time; }
+    function secondsSince(t) { return (request.time - t).seconds(); }
+
+    // ── Users ──────────────────────────────────────────────────────────────
+    function validProfile(d) {
+      return str(d.displayName, 1, 80)
+        && optStr(d.phone, 30)
+        && optStr(d.photoURL, 2048)
+        && optStr(d.bio, 500);
+    }
+
+    match /users/{userId} {
+      allow read: if signedIn() && (uid() == userId || isStaffRole());
+
+      // Self sign-up always starts as a student — role escalation is impossible.
+      allow create: if signedIn() && uid() == userId
+        && incoming().uid == userId
+        && incoming().role == 'student'
+        && incoming().email == request.auth.token.email
+        && incoming().keys().hasOnly(['uid', 'email', 'displayName', 'photoURL', 'phone', 'bio',
+                                      'role', 'notifications', 'createdAt', 'updatedAt'])
+        && validProfile(incoming());
+
+      allow update: if signedIn() && (
+        // Users may edit their own profile, never their role or email.
+        (uid() == userId
+          && changed().hasOnly(['displayName', 'phone', 'photoURL', 'bio', 'notifications', 'updatedAt'])
+          && validProfile(incoming()))
+        ||
+        // Role changes (never your own). Admins manage students & instructors;
+        // only a super admin can grant or revoke admin. Every change must be
+        // written together with its audit-log entry (same batch).
+        (isAdmin() && uid() != userId
+          && changed().hasOnly(['role', 'updatedAt', 'lastAuditId'])
+          && roleChangeAllowed(resource.data.role, incoming().role)
+          && roleChangeAudited(userId))
+      );
+
+      allow delete: if false;
+
+      // Private per-lesson notes.
+      match /notes/{noteId} {
+        allow read, delete: if signedIn() && uid() == userId;
+        allow create, update: if signedIn() && uid() == userId
+          && str(incoming().content, 0, 20000)
+          && incoming().courseId is string
+          && incoming().lessonId is string;
+      }
+
+      // In-app notifications. Written by the actor (fan-out on write), read
+      // and marked as read only by the recipient.
+      match /notifications/{notificationId} {
+        allow read, delete: if signedIn() && uid() == userId;
+        allow update: if signedIn() && uid() == userId
+          && changed().hasOnly(['read']) && incoming().read is bool;
+        allow create: if signedIn() && validNotification(incoming()) && canNotify(userId, incoming());
+      }
+    }
+
+    function roleChangeAllowed(oldRole, newRole) {
+      return (isSuperAdmin() && oldRole != 'superadmin' && newRole in ['student', 'instructor', 'admin'])
+        || (me().role == 'admin' && oldRole in ['student', 'instructor'] && newRole in ['student', 'instructor']);
+    }
+    function roleChangeAudited(userId) {
+      let id = request.resource.data.get('lastAuditId', '');
+      let path = /databases/$(database)/documents/auditLogs/$(id);
+      return id is string && id.size() > 0
+        && !exists(path)
+        && getAfter(path).data.actorId == uid()
+        && getAfter(path).data.action == 'user.role_changed'
+        && getAfter(path).data.targetId == userId;
+    }
+
+    // ── Audit log (append-only; readable by super admins only) ──────────────
+    match /auditLogs/{logId} {
+      allow read: if isSuperAdmin();
+      allow create: if isStaffRole()
+        && incoming().keys().hasOnly(['actorId', 'actorName', 'actorRole', 'action', 'targetType', 'targetId',
+                                      'targetLabel', 'courseId', 'summary', 'createdAt'])
+        && incoming().actorId == uid()
+        && incoming().actorRole == me().role
+        && str(incoming().actorName, 1, 80)
+        && str(incoming().action, 1, 60)
+        && str(incoming().summary, 1, 400)
+        && isNow(incoming().createdAt);
+      allow update, delete: if false;
+    }
+
+    // ── Platform settings (super admin) ─────────────────────────────────────
+    match /settings/{docId} {
+      allow read: if signedIn();
+      allow create, update: if isSuperAdmin() && docId == 'platform'
+        && incoming().aiAssistantEnabled is bool;
+      allow delete: if false;
+    }
+
+    function validNotification(d) {
+      return d.keys().hasOnly(['type', 'title', 'body', 'link', 'courseId', 'actorId', 'actorName', 'read', 'createdAt'])
+        && d.type in ['announcement', 'assignment_created', 'assignment_graded', 'submission_received',
+                      'live_scheduled', 'enrolled', 'discussion', 'course_completed']
+        && str(d.title, 1, 140)
+        && str(d.body, 0, 500)
+        && str(d.link, 1, 300)
+        && d.link.matches('/([^/].*)?')            // internal links only (no phishing redirects)
+        && d.actorId == uid()
+        && str(d.actorName, 1, 80)
+        && d.read == false
+        && isNow(d.createdAt)
+        && (d.courseId == null || d.courseId is string);
+    }
+
+    // Who may notify whom:
+    //  • anyone → themselves; admins → anyone
+    //  • course instructors → anyone (e.g. their students)
+    //  • enrolled learners → the course's instructors or fellow learners
+    function canNotify(userId, d) {
+      return uid() == userId
+        || isAdmin()
+        || (d.courseId is string && (
+              isCourseInstructor(d.courseId)
+              || (isEnrolled(d.courseId)
+                  && (userId in course(d.courseId).instructorIds
+                      || exists(/databases/$(database)/documents/courses/$(d.courseId)/enrollments/$(userId))))
+           ));
+    }
+
+    // ── Courses ────────────────────────────────────────────────────────────
+    function validCourse(d) {
+      return str(d.title, 3, 120)
+        && str(d.code, 0, 24)
+        && str(d.description, 0, 5000)
+        && str(d.category, 0, 60)
+        && d.status in ['draft', 'published', 'archived']
+        && d.level in ['beginner', 'intermediate', 'advanced']
+        && d.instructorIds is list && d.instructorIds.size() <= 10
+        && d.instructorNames is list && d.instructorNames.size() <= 10
+        && d.allowSelfEnroll is bool
+        && num(d.get('requiredWatchPercent', 90), 0, 100)
+        && d.get('sequential', false) is bool
+        && d.get('requiredCourseworkIds', []) is list && d.get('requiredCourseworkIds', []).size() <= 200
+        && optStr(d.coverImageUrl, 2048)
+        && optStr(d.cohort, 80);
+    }
+
+    // ── Video-watch enforcement ────────────────────────────────────────────
+    function lessonData(courseId, lessonId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)/lessons/$(lessonId)).data;
+    }
+    function progressData(courseId, lessonId) {
+      return get(/databases/$(database)/documents/courses/$(courseId)/enrollments/$(request.auth.uid)/lessonProgress/$(lessonId)).data;
+    }
+    function hasWatched(courseId, lessonId, lesson, required) {
+      let p = progressData(courseId, lessonId);
+      let videoLength = lesson.get('videoDurationSeconds', 0) > 0 ? lesson.videoDurationSeconds : p.duration;
+      return p.maxWatched >= videoLength * required / 100 - 2;
+    }
+    // A video lesson can only be completed once enough of it has been watched.
+    function canCompleteLesson(courseId, lessonId) {
+      let lesson = lessonData(courseId, lessonId);
+      let required = course(courseId).get('requiredWatchPercent', 90);
+      return lesson.get('hasVideo', false) != true
+        || required == 0
+        || hasWatched(courseId, lessonId, lesson, required);
+    }
+
+    function studentEnrollmentUpdate(courseId) {
+      let inc = request.resource.data;
+      let old = resource.data;
+      let added = inc.get('lastCompletedLessonId', null);
+      let total = course(courseId).lessonCount;
+      // Required coursework: `passedCourseworkIds` is written by graders only
+      // (students can't touch it), so it is trustworthy proof of passing.
+      let required = course(courseId).get('requiredCourseworkIds', []);
+      let passed = old.get('passedCourseworkIds', []);
+      return changed().hasOnly(['completedLessonIds', 'progress', 'lastLessonId', 'lastCompletedLessonId',
+                                'status', 'updatedAt', 'completedAt'])
+        && num(inc.progress, 0, 100)
+        && inc.status in ['active', 'completed']
+        && inc.completedLessonIds is list
+        && inc.completedLessonIds.size() <= 1000
+        // Progress must be consistent with completed lessons + passed coursework.
+        && (inc.progress == old.progress
+            || (total > 0 && inc.progress <= (inc.completedLessonIds.size() + passed.size()) * 100 / (total + required.size()) + 1))
+        // A course is only complete with every lesson done AND all required coursework passed.
+        && (inc.status == 'active' || inc.status == old.status
+            || (inc.completedLessonIds.size() >= total && passed.hasAll(required)))
+        && (
+          inc.completedLessonIds == old.completedLessonIds
+          // un-completing lessons is always allowed
+          || old.completedLessonIds.hasAll(inc.completedLessonIds)
+          // completing exactly one lesson, with proof of watching for videos
+          || (inc.completedLessonIds.size() == old.completedLessonIds.size() + 1
+              && inc.completedLessonIds.hasAll(old.completedLessonIds)
+              && added is string
+              && added in inc.completedLessonIds
+              && !(added in old.completedLessonIds)
+              && canCompleteLesson(courseId, added))
+        );
+    }
+
+    function validLessonProgress(d) {
+      return d.keys().hasOnly(['position', 'maxWatched', 'duration', 'percent', 'updatedAt'])
+        && num(d.position, 0, 86400)
+        && num(d.maxWatched, 0, 86400)
+        && num(d.duration, 1, 86400)
+        && num(d.percent, 0, 100)
+        && d.maxWatched <= d.duration + 5
+        && isNow(d.updatedAt);
+    }
+
+    function validLiveSession() {
+      return str(incoming().title, 3, 200)
+        && incoming().startAt is timestamp
+        && num(incoming().durationMinutes, 5, 600)
+        && optStr(incoming().meetingUrl, 2048)
+        && optStr(incoming().recordingUrl, 2048)
+        && incoming().get('mode', 'external') in ['in_app', 'external']
+        // Uploaded recording files (staff-managed; the files live in Storage).
+        && incoming().get('recordings', []) is list && incoming().get('recordings', []).size() <= 50
+        && (incoming().get('endedAt', null) == null || incoming().endedAt is timestamp);
+    }
+
+    match /courses/{courseId} {
+      allow read: if signedIn() && (
+        resource.data.status == 'published'
+        || isAdmin()
+        || (isInstructor() && uid() in resource.data.instructorIds)
+        || isEnrolled(courseId)
+      );
+
+      allow create: if isStaffRole()
+        && validCourse(incoming())
+        && incoming().createdBy == uid()
+        && (isAdmin() || incoming().instructorIds == [uid()]);
+
+      allow update: if validCourse(incoming())
+        && incoming().createdBy == resource.data.createdBy
+        && (isAdmin()
+            || (isCourseInstructor(courseId) && incoming().instructorIds == resource.data.instructorIds));
+
+      allow delete: if isAdmin();
+
+      // Module & lesson outlines are visible to anyone who can see a published
+      // course (for the syllabus); lesson *content* is gated by enrolment below.
+      match /modules/{moduleId} {
+        allow read: if signedIn() && (isPublished(courseId) || canAccessCourse(courseId));
+        allow create, update: if isCourseStaff(courseId)
+          && str(incoming().title, 1, 160) && incoming().order is number;
+        allow delete: if isCourseStaff(courseId);
+      }
+
+      match /lessons/{lessonId} {
+        allow read: if signedIn() && (isPublished(courseId) || canAccessCourse(courseId));
+        allow create, update: if isCourseStaff(courseId)
+          && str(incoming().title, 1, 200)
+          && incoming().type in ['video', 'article']
+          && incoming().moduleId is string
+          && incoming().order is number
+          && num(incoming().durationMinutes, 0, 1000)
+          && incoming().get('hasVideo', false) is bool
+          && num(incoming().get('videoDurationSeconds', 0), 0, 86400);
+        allow delete: if isCourseStaff(courseId);
+      }
+
+      match /lessonContent/{lessonId} {
+        allow read: if canAccessCourse(courseId);
+        allow create, update: if isCourseStaff(courseId)
+          && str(incoming().body, 0, 100000)
+          && optStr(incoming().videoUrl, 2048)
+          && optStr(incoming().get('transcript', null), 200000)
+          && incoming().resources is list && incoming().resources.size() <= 20;
+        allow delete: if isCourseStaff(courseId);
+      }
+
+      // ── Enrolments (doc id == student uid) ───────────────────────────────
+      match /enrollments/{userId} {
+        allow read: if signedIn() && (uid() == userId || isCourseStaff(courseId));
+
+        allow create: if signedIn()
+          && incoming().userId == userId
+          && incoming().courseId == courseId
+          && incoming().progress == 0
+          && incoming().completedLessonIds.size() == 0
+          && incoming().get('passedCourseworkIds', []).size() == 0
+          && incoming().status == 'active'
+          && (isCourseStaff(courseId)
+              || (uid() == userId && isPublished(courseId) && course(courseId).allowSelfEnroll == true));
+
+        allow update: if signedIn() && (
+          (uid() == userId && studentEnrollmentUpdate(courseId))
+          || isCourseStaff(courseId)
+        );
+
+        allow delete: if isCourseStaff(courseId);
+
+        // Per-lesson video progress. Watch position may only move forward at
+        // (at most) 2.5× real time, so skipping ahead can't be faked.
+        match /lessonProgress/{lessonId} {
+          allow read: if signedIn() && (uid() == userId || isCourseStaff(courseId));
+          allow create: if signedIn() && uid() == userId && isEnrolled(courseId)
+            && validLessonProgress(incoming())
+            && incoming().maxWatched <= 60;
+          allow update: if signedIn() && uid() == userId
+            && validLessonProgress(incoming())
+            && incoming().maxWatched >= resource.data.maxWatched
+            && incoming().maxWatched <= resource.data.maxWatched + secondsSince(resource.data.updatedAt) * 2.5 + 20
+            && incoming().duration >= resource.data.duration * 0.9;
+          allow delete: if isCourseStaff(courseId);
+        }
+      }
+
+      // ── Assignments & submissions ────────────────────────────────────────
+      match /assignments/{assignmentId} {
+        allow read: if canAccessCourse(courseId);
+        allow create, update: if isCourseStaff(courseId)
+          && str(incoming().title, 3, 200)
+          && str(incoming().description, 0, 10000)
+          && num(incoming().points, 1, 1000)
+          && incoming().dueAt is timestamp
+          && incoming().courseId == courseId
+          // Module coursework: optional module link, required flag and pass mark.
+          && optStr(incoming().get('moduleId', null), 200)
+          && incoming().get('required', false) is bool
+          && num(incoming().get('passMark', 0), 0, incoming().points);
+        allow delete: if isCourseStaff(courseId);
+
+        // Doc id == student uid → at most one submission per student.
+        match /submissions/{userId} {
+          allow read: if signedIn() && (uid() == userId || isCourseStaff(courseId));
+
+          allow create: if signedIn() && uid() == userId
+            && isEnrolled(courseId)
+            && incoming().userId == userId
+            && incoming().courseId == courseId
+            && incoming().assignmentId == assignmentId
+            && incoming().status == 'submitted'
+            && incoming().grade == null
+            && incoming().feedback == null
+            && str(incoming().fileName, 1, 255)
+            && str(incoming().filePath, 1, 1024)
+            && optStr(incoming().note, 2000);
+
+          allow update: if signedIn() && (
+            // Students may resubmit until graded — or after a failing grade
+            // (below the pass mark), which resets the submission for regrading.
+            (uid() == userId
+              && (resource.data.status == 'submitted'
+                  || (resource.data.status == 'graded'
+                      && resource.data.grade < get(/databases/$(database)/documents/courses/$(courseId)/assignments/$(assignmentId)).data.get('passMark', 0)))
+              && changed().hasOnly(['fileName', 'filePath', 'fileUrl', 'fileSize', 'note', 'submittedAt',
+                                    'status', 'grade', 'feedback', 'gradedAt', 'gradedBy', 'gradedByName'])
+              && incoming().status == 'submitted'
+              && incoming().grade == null
+              && incoming().feedback == null
+              && str(incoming().fileName, 1, 255)
+              && optStr(incoming().note, 2000))
+            ||
+            // Staff grade within the assignment's point range.
+            (isCourseStaff(courseId)
+              && changed().hasOnly(['grade', 'feedback', 'status', 'gradedAt', 'gradedBy', 'gradedByName'])
+              && incoming().status == 'graded'
+              && num(incoming().grade, 0,
+                     get(/databases/$(database)/documents/courses/$(courseId)/assignments/$(assignmentId)).data.points)
+              && optStr(incoming().feedback, 5000))
+          );
+
+          allow delete: if isCourseStaff(courseId);
+        }
+      }
+
+      // ── Live sessions & the in-platform classroom ────────────────────────
+      match /liveSessions/{sessionId} {
+        allow read: if canAccessCourse(courseId);
+        // Classes run on Zoom / Meet / Teams; staff schedule them, mark them
+        // ended and add the recording (uploaded video and/or link) afterwards.
+        allow create: if isCourseStaff(courseId) && validLiveSession() && incoming().courseId == courseId
+          && incoming().get('endedAt', null) == null;
+        allow update: if isCourseStaff(courseId) && validLiveSession() && incoming().courseId == courseId;
+        allow delete: if isCourseStaff(courseId);
+
+        // Attendance: who opened the meeting link (one doc per participant).
+        match /attendance/{userId} {
+          allow read: if canAccessCourse(courseId);
+          allow create: if signedIn() && uid() == userId && canAccessCourse(courseId)
+            && incoming().userId == userId
+            && str(incoming().userName, 1, 80)
+            && incoming().minutes == 0
+            && isNow(incoming().firstJoinedAt)
+            && isNow(incoming().lastSeenAt);
+          allow update: if signedIn() && uid() == userId
+            && changed().hasOnly(['lastSeenAt', 'minutes'])
+            && isNow(incoming().lastSeenAt)
+            && (incoming().minutes == resource.data.minutes
+                || (incoming().minutes == resource.data.minutes + 1 && secondsSince(resource.data.lastSeenAt) >= 45));
+          allow delete: if isCourseStaff(courseId);
+        }
+      }
+
+      // ── Announcements ────────────────────────────────────────────────────
+      match /announcements/{announcementId} {
+        allow read: if canAccessCourse(courseId);
+        allow create, update: if isCourseStaff(courseId)
+          && str(incoming().title, 1, 160)
+          && str(incoming().body, 1, 10000)
+          && incoming().pinned is bool
+          && str(incoming().authorName, 1, 80);
+        allow delete: if isCourseStaff(courseId);
+      }
+
+      // ── Lesson discussions (Q&A) ─────────────────────────────────────────
+      match /discussions/{postId} {
+        allow read: if canAccessCourse(courseId);
+        allow create: if canAccessCourse(courseId)
+          && incoming().keys().hasOnly(['lessonId', 'parentId', 'authorId', 'authorName', 'authorRole',
+                                        'body', 'resolved', 'createdAt', 'updatedAt'])
+          && incoming().authorId == uid()
+          && incoming().lessonId is string
+          && (incoming().parentId == null || incoming().parentId is string)
+          && str(incoming().body, 1, 4000)
+          && incoming().resolved == false
+          && isNow(incoming().createdAt);
+        allow update: if signedIn() && (
+          (resource.data.authorId == uid()
+            && changed().hasOnly(['body', 'updatedAt', 'resolved'])
+            && str(incoming().body, 1, 4000)
+            && incoming().resolved is bool)
+          || (isCourseStaff(courseId) && changed().hasOnly(['resolved', 'updatedAt']) && incoming().resolved is bool)
+        );
+        allow delete: if signedIn() && (resource.data.authorId == uid() || isCourseStaff(courseId));
+      }
+
+      // ── Activity feed (append-only) ──────────────────────────────────────
+      match /activity/{activityId} {
+        allow read: if canAccessCourse(courseId);
+        allow create: if signedIn()
+          && incoming().actorId == uid()
+          && incoming().courseId == courseId
+          && str(incoming().message, 1, 300)
+          && canAccessCourse(courseId);
+        allow update: if false;
+        allow delete: if isCourseStaff(courseId);
+      }
+    }
+
+    // ── Collection-group queries ─────────────────────────────────────────────
+    match /{path=**}/enrollments/{userId} {
+      allow read: if signedIn() && (resource.data.userId == uid() || isAdmin());
+    }
+    match /{path=**}/submissions/{userId} {
+      allow read: if signedIn() && (resource.data.userId == uid() || isAdmin());
+    }
+    match /{path=**}/activity/{activityId} {
+      allow read: if isAdmin();
+    }
+  }
+}

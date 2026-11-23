@@ -1,0 +1,36 @@
+# Firebase App Hosting configuration.
+# Docs: https://firebase.google.com/docs/app-hosting/configure
+#
+# The Firebase web config (NEXT_PUBLIC_FIREBASE_*) is injected automatically by
+# App Hosting at build time via FIREBASE_WEBAPP_CONFIG — next.config.ts reads it,
+# so you don't need to set those values here.
+
+runConfig:
+  minInstances: 0 # set to 1 to avoid cold starts
+  maxInstances: 10
+  concurrency: 80
+  cpu: 1
+  memoryMiB: 512
+
+env:
+  - variable: NEXT_PUBLIC_APP_NAME
+    value: Jinasena Training Foundation
+    availability: [BUILD, RUNTIME]
+
+  # Your public URL (canonical links, Open Graph). Update after connecting a custom domain.
+  # - variable: NEXT_PUBLIC_SITE_URL
+  #   value: https://learn.example.com
+  #   availability: [BUILD, RUNTIME]
+
+  # AI study assistant (Firebase AI Logic → Vertex AI Gemini API). Optional overrides.
+  # - variable: NEXT_PUBLIC_GEMINI_MODEL
+  #   value: gemini-3.8-flash
+  #   availability: [BUILD, RUNTIME]
+  # - variable: NEXT_PUBLIC_AI_LOCATION
+  #   value: global
+  #   availability: [BUILD, RUNTIME]
+
+  # Optional: Firebase App Check with reCAPTCHA Enterprise (recommended).
+  # - variable: NEXT_PUBLIC_RECAPTCHA_SITE_KEY
+  #   value: your-recaptcha-enterprise-site-key
+  #   availability: [BUILD, RUNTIME]
